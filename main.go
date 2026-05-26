@@ -28,17 +28,18 @@ func main() {
 	log.Println("SVX ↔ UDP/OPUS Bridge starting...")
 
 	// --- Configuration ---
-	svxHost := envRequired("REFLECTOR_HOST")
-	svxPort := envInt("REFLECTOR_PORT", 5300)
-	svxAuthKey := envRequired("REFLECTOR_AUTH_KEY")
-	svxTG := uint32(envInt("REFLECTOR_TG", 1))
-	callsign := envRequired("CALLSIGN")
-	nodeLocation := envDefault("NODE_LOCATION", "")
-	sysop := envDefault("SYSOP", "")
+svxHost := envRequired("REFLECTOR_HOST")
+    svxPort := envInt("REFLECTOR_PORT", 5300)
+    svxAuthKey := envRequired("REFLECTOR_AUTH_KEY")
+    svxTG := uint32(envInt("REFLECTOR_TG", 1))
+    callsign := envRequired("CALLSIGN")
+    nodeLocation := envDefault("NODE_LOCATION", "")
+    sysop := envDefault("SYSOP", "")
 
 	// UDP OPUS config (replaces Zello)
-	opusListenAddr := envDefault("OPUS_LISTEN_ADDR", "0.0.0.0:5045")
-	opusSendAddr := envRequired("OPUS_SEND_ADDR") // e.g., "44.5.24.206:5045"
+	janusURL := envRequired("JANUS_URL") // 👈 Replaces OPUS_SEND_ADDR
+	//opusListenAddr := envDefault("OPUS_LISTEN_ADDR", "0.0.0.0:5045")
+	opusSendAddr := envRequired("JANUS_URL") // e.g., "44.5.24.206:5045"
 
 	redisURL := os.Getenv("REDIS_URL")
 
