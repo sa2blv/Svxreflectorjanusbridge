@@ -12,11 +12,15 @@ import (
 
 const (
 	// RTP constants for OPUS
-	OpusPayloadType   = 111 // RFC 7587 dynamic payload type
+	OpusPayloadType   = 111 
 	OpusClockRate     = 48000
-	OpusChannels      = 1
-	OpusFrameDuration = 60 // milliseconds (20ms frame in RTP terms)
+	OpusChannels      = 2   
+	OpusFrameDuration = 20  
 )
+
+// Official Opus 20ms stereo silence packet payload
+var OpusStereoSilence = []byte{0xfc, 0xff, 0xfe}
+
 
 // RTPHeader represents an RTP packet header.
 type RTPHeader struct {
@@ -32,7 +36,6 @@ type RTPHeader struct {
 }
 
 // OpusUDPClient manages bidirectional OPUS/RTP audio over UDP.
-// Sends to a remote address and receives from a local listening port.
 type OpusUDPClient struct {
 	// Receive config
 	listenAddr string
@@ -45,6 +48,7 @@ type OpusUDPClient struct {
 	// RX state
 	rxSSRC     uint32
 	rxTimestamp uint32
+	jitterBuf   *JitterBuffer 
 
 	// TX state
 	txSSRC    uint32
@@ -65,7 +69,6 @@ type OpusUDPClient struct {
 
 // NewOpusUDPClient creates a new UDP OPUS/RTP client.
 func NewOpusUDPClient(listenAddr, sendAddr string) (*OpusUDPClient, error) {
-	// Parse send address
 	remoteAddr, err := net.ResolveUDPAddr("udp", sendAddr)
 	if err != nil {
 		return nil, fmt.Errorf("resolve send address: %w", err)
@@ -77,6 +80,8 @@ func NewOpusUDPClient(listenAddr, sendAddr string) (*OpusUDPClient, error) {
 		txSSRC:     uint32(time.Now().UnixNano()),
 		txSeq:      uint16(time.Now().UnixNano()),
 		txTS:       0,
+		// 120ms max buffer, 60ms initial delay cushion to match your 60ms frame duration
+		jitterBuf:  NewJitterBuffer(60, 60*time.Millisecond),
 	}, nil
 }
 
@@ -103,7 +108,6 @@ func (c *OpusUDPClient) Connect() error {
 	c.done = make(chan struct{})
 	c.mu.Unlock()
 
-	// Bind listening UDP socket
 	listenUDPAddr, err := net.ResolveUDPAddr("udp", c.listenAddr)
 	if err != nil {
 		return fmt.Errorf("resolve listen address: %w", err)
@@ -115,7 +119,6 @@ func (c *OpusUDPClient) Connect() error {
 	}
 	c.listenConn = listenConn
 
-	// Open sending UDP socket
 	sendConn, err := net.DialUDP("udp", nil, c.sendAddr)
 	if err != nil {
 		listenConn.Close()
@@ -123,7 +126,7 @@ func (c *OpusUDPClient) Connect() error {
 	}
 	c.sendConn = sendConn
 
-	log.Printf("[OpusUDP] Listening on %s, sending to %s", c.listenAddr, c.sendAddr)
+	log.Printf("[Janus] Listening on %s, sending to %s", c.listenAddr, c.sendAddr)
 	return nil
 }
 
@@ -142,12 +145,15 @@ func (c *OpusUDPClient) StartStream() (uint32, error) {
 	c.txSeq = uint16(time.Now().UnixNano() & 0xFFFF)
 	c.txTS = 0
 
-	log.Printf("[OpusUDP] TX stream started (id=%d)", streamID)
+	log.Printf("[Janus] TX stream started (id=%d)", streamID)
 	return streamID, nil
 }
 
 // SendAudio sends a single OPUS frame as an RTP packet.
+// SendAudio sends a single OPUS frame. If opusData is empty/nil, 
+// it automatically sends a standard Opus stereo silence packet to keep Janus alive.
 func (c *OpusUDPClient) SendAudio(opusData []byte) error {
+	// If txActive is completely off, we don't send anything (e.g., when disconnecting)
 	if !c.txActive.Load() {
 		return nil
 	}
@@ -161,17 +167,23 @@ func (c *OpusUDPClient) SendAudio(opusData []byte) error {
 	seq := c.txSeq
 	ts := c.txTS
 	c.txSeq++
-	c.txTS += (OpusClockRate / 1000) * OpusFrameDuration // increment by frame duration in clock units
+	c.txTS += (OpusClockRate / 1000) * OpusFrameDuration
 	conn := c.sendConn
 	c.mu.Unlock()
 
-	// Build RTP header
-	header := c.buildRTPHeader(seq, ts, true) // marker=true for each packet
-	pkt := c.encodeRTPPacket(header, opusData)
+	// SILENCE INSERTION: If no audio data is provided, use the Janus-compliant stereo silence frame
+	payload := opusData
+	if len(payload) == 0 {
+		payload = OpusStereoSilence
+	}
+
+	header := c.buildRTPHeader(seq, ts, true)
+	pkt := c.encodeRTPPacket(header, payload)
 
 	_, err := conn.Write(pkt)
 	return err
 }
+
 
 // StopStream ends the outgoing audio stream.
 func (c *OpusUDPClient) StopStream() error {
@@ -181,7 +193,7 @@ func (c *OpusUDPClient) StopStream() error {
 	c.txStreamID = 0
 	c.mu.Unlock()
 
-	log.Printf("[OpusUDP] TX stream stopped (id=%d)", streamID)
+	log.Printf("[Janus] TX stream stopped (id=%d)", streamID)
 	return nil
 }
 
@@ -197,10 +209,47 @@ func (c *OpusUDPClient) RunReader() {
 	}()
 
 	buf := make([]byte, 4096)
-	streamActive := false
 	var activeStreamID uint32
+	var hasNotifiedStart bool
+
+	// Background playback loop
+	stopPlayback := make(chan struct{})
+go func() {
+		// 20ms is the standard sweet spot for checking audio availability
+		ticker := time.NewTicker(20 * time.Millisecond) 
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if c.onStreamData != nil {
+					// CATCH-UP LOOP: 
+					// If packets are piled up due to network lag, drain them quickly 
+					// to minimize latency and restore real-time playback.
+					for {
+						pkt, ok := c.jitterBuf.Pop()
+						if !ok {
+							break // Buffer is empty or still cushioning, stop draining
+						}
+						
+						// Dispatch the audio packet
+						c.onStreamData(activeStreamID, uint32(pkt.Sequence), pkt.Payload)
+						
+						// If your frame size is 60ms, playing them too fast will cause a local underrun.
+						// We break early if the buffer size returns to a healthy "normal" state.
+						// This allows a burst to clear out accidental pile-ups without emptying the cushion.
+						break 
+					}
+				}
+			case <-stopPlayback:
+				return
+			}
+		}
+	}()
+	defer close(stopPlayback)
 
 	for {
+		// Long deadline, we always accept data
 		c.listenConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		n, remoteAddr, err := c.listenConn.ReadFromUDP(buf)
 		if err != nil {
@@ -208,53 +257,47 @@ func (c *OpusUDPClient) RunReader() {
 				return
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				// Handle timeout: if stream was active, send stop event
-				if streamActive {
-					streamActive = false
-					if c.onStreamStop != nil {
-						c.onStreamStop(activeStreamID)
-					}
-					log.Printf("[OpusUDP] RX stream timeout (id=%d)", activeStreamID)
+				// On total silence timeout, flush buffer and clear stream notify state
+				hasNotifiedStart = false
+				c.jitterBuf.Flush()
+				if c.onStreamStop != nil {
+					c.onStreamStop(activeStreamID)
 				}
+				log.Printf("[janus] RX stream absolute timeout (id=%d)", activeStreamID)
 				continue
 			}
-			log.Printf("[OpusUDP] Read error: %v", err)
+			log.Printf("[Janus] Read error: %v", err)
 			return
 		}
 
-		// Parse RTP packet
 		if n < 12 {
-			continue // RTP header is at least 12 bytes
+			continue
 		}
 
 		header, payload, err := c.parseRTPPacket(buf[:n])
 		if err != nil {
-			log.Printf("[OpusUDP] Parse RTP error: %v", err)
+			log.Printf("[Janus] Parse RTP error: %v", err)
 			continue
 		}
 
-		// Check for payload type (OPUS = 111, or check if different)
-		if header.PT != OpusPayloadType && header.PT != 48 { // 48 is sometimes used for OPUS
+		if header.PT != OpusPayloadType && header.PT != 48 {
 			continue
 		}
 
-		// Track stream state
-		if !streamActive {
-			streamActive = true
-			activeStreamID = header.SSRC
-			c.rxSSRC = header.SSRC
+		activeStreamID = header.SSRC
+		c.rxSSRC = header.SSRC
+
+		// Fire optional lifecycle hook once per session change
+		if !hasNotifiedStart {
+			hasNotifiedStart = true
 			if c.onStreamStart != nil {
 				c.onStreamStart(activeStreamID, remoteAddr.IP.String())
 			}
-			log.Printf("[OpusUDP] RX stream start: id=%d from=%s", activeStreamID, remoteAddr.IP)
 		}
 
-		// Reset timeout on each packet
-		c.listenConn.SetReadDeadline(time.Now().Add(30 * time.Second))
-
-		// Send audio data
-		if c.onStreamData != nil && len(payload) > 0 {
-			c.onStreamData(activeStreamID, uint32(header.Seq), payload)
+		// Push data immediately. The buffer handles ordering and structural underruns.
+		if len(payload) > 0 {
+			c.jitterBuf.Push(header.Seq, header.TS, payload)
 		}
 	}
 }
@@ -266,12 +309,12 @@ func (c *OpusUDPClient) buildRTPHeader(seq uint16, ts uint32, marker bool) *RTPH
 		m = 1
 	}
 	return &RTPHeader{
-		V:    2,                 // RTP version 2
-		P:    0,                 // No padding
-		X:    0,                 // No extension
-		CC:   0,                 // No CSRC
-		M:    m,                 // Marker
-		PT:   OpusPayloadType,   // Payload type for OPUS
+		V:    2,
+		P:    0,
+		X:    0,
+		CC:   0,
+		M:    m,
+		PT:   OpusPayloadType,
 		Seq:  seq,
 		TS:   ts,
 		SSRC: c.txSSRC,
@@ -281,25 +324,12 @@ func (c *OpusUDPClient) buildRTPHeader(seq uint16, ts uint32, marker bool) *RTPH
 // encodeRTPPacket encodes an RTP header and OPUS payload into a byte slice.
 func (c *OpusUDPClient) encodeRTPPacket(header *RTPHeader, payload []byte) []byte {
 	pkt := make([]byte, 12+len(payload))
-
-	// Byte 0: V(2), P(1), X(1), CC(4)
 	pkt[0] = (header.V << 6) | (header.P << 5) | (header.X << 4) | header.CC
-
-	// Byte 1: M(1), PT(7)
 	pkt[1] = (header.M << 7) | header.PT
-
-	// Bytes 2-3: Sequence number
 	binary.BigEndian.PutUint16(pkt[2:4], header.Seq)
-
-	// Bytes 4-7: Timestamp
 	binary.BigEndian.PutUint32(pkt[4:8], header.TS)
-
-	// Bytes 8-11: SSRC
 	binary.BigEndian.PutUint32(pkt[8:12], header.SSRC)
-
-	// Payload
 	copy(pkt[12:], payload)
-
 	return pkt
 }
 
@@ -321,11 +351,9 @@ func (c *OpusUDPClient) parseRTPPacket(data []byte) (*RTPHeader, []byte, error) 
 		SSRC: binary.BigEndian.Uint32(data[8:12]),
 	}
 
-	// Skip CSRC list (4 bytes per CSRC)
 	csrcSize := int(header.CC) * 4
 	headerLen := 12 + csrcSize
 
-	// Skip extension if present
 	if header.X != 0 {
 		if len(data) < headerLen+4 {
 			return nil, nil, fmt.Errorf("packet too short for extension")
@@ -338,7 +366,6 @@ func (c *OpusUDPClient) parseRTPPacket(data []byte) (*RTPHeader, []byte, error) 
 		return nil, nil, fmt.Errorf("packet too short for headers")
 	}
 
-	// Skip padding if present
 	payloadEnd := len(data)
 	if header.P != 0 && len(data) > 0 {
 		paddingLen := int(data[len(data)-1])
@@ -347,8 +374,7 @@ func (c *OpusUDPClient) parseRTPPacket(data []byte) (*RTPHeader, []byte, error) 
 		}
 	}
 
-	payload := data[headerLen:payloadEnd]
-	return header, payload, nil
+	return header, data[headerLen:payloadEnd], nil
 }
 
 func (c *OpusUDPClient) isClosed() bool {

@@ -165,9 +165,9 @@ func (c *SVXLinkClient) Connect() error {
 	// Send NodeInfo
 	infoMap := map[string]string{
 		"callsign":  c.callsign,
-		"sw":        "Zello_Bridge",
+		"sw":        "Janus Bridge",
 		"swVer":     "1.1",
-		"nodeClass": "zello",
+		"nodeClass": "Stream",
 	}
 	if c.nodeLocation != "" {
 		infoMap["nodeLocation"] = c.nodeLocation

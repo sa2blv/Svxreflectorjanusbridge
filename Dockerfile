@@ -5,9 +5,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# Copy the module definitions over
 COPY go.mod go.sum* ./
 RUN go mod download
+
+# Copy the rest of your source code scripts over
 COPY *.go ./
+
+# FORCE GO TO AUTOMATICALLY RESOLVE MISSING CHECKSUMS INSIDE CONTAINER
+RUN go mod tidy
+
+# Compile the binary securely with CGO enabled for libopus
 RUN CGO_ENABLED=1 go build -o svx_opus_bridge .
 
 # --- Runtime stage ---

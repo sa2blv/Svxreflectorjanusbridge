@@ -15,30 +15,29 @@ import (
 )
 
 const (
-	SVXSampleRate   = 48000
-	SVXFrameSize    = 960  // 20ms at 48kHz
-	OpusDecodeRate  = 48000 // decode OPUS at 48kHz
-	OpusEncodeRate  = 48000 // encode OPUS at 48kHz
-	OpusFrameSize   = 960   // 20ms at 48kHz (same as SVX frame)
-	OpusFramesPerPkt = 1    // 1 frame per RTP packet
+	SVXSampleRate    = 48000
+	SVXFrameSize     = 960   // 20ms at 48kHz
+	OpusDecodeRate   = 48000 // decode OPUS at 48kHz
+	OpusEncodeRate   = 48000 // encode OPUS at 48kHz
+	OpusFrameSize    = 960   // 20ms at 48kHz (same as SVX frame)
+	OpusFramesPerPkt = 1     // 1 frame per RTP packet
 )
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-	log.Println("SVX ↔ UDP/OPUS Bridge starting...")
+	log.Println("SVX <-> UDP/OPUS Bridge starting...")
 
 	// --- Configuration ---
-svxHost := envRequired("REFLECTOR_HOST")
-    svxPort := envInt("REFLECTOR_PORT", 5300)
-    svxAuthKey := envRequired("REFLECTOR_AUTH_KEY")
-    svxTG := uint32(envInt("REFLECTOR_TG", 1))
-    callsign := envRequired("CALLSIGN")
-    nodeLocation := envDefault("NODE_LOCATION", "")
-    sysop := envDefault("SYSOP", "")
+	svxHost := envRequired("REFLECTOR_HOST")
+	svxPort := envInt("REFLECTOR_PORT", 5300)
+	svxAuthKey := envRequired("REFLECTOR_AUTH_KEY")
+	svxTG := uint32(envInt("REFLECTOR_TG", 1))
+	callsign := envRequired("CALLSIGN")
+	nodeLocation := envDefault("NODE_LOCATION", "")
+	sysop := envDefault("SYSOP", "")
 
-	// UDP OPUS config (replaces Zello)
-	janusURL := envRequired("JANUS_URL") // 👈 Replaces OPUS_SEND_ADDR
-	//opusListenAddr := envDefault("OPUS_LISTEN_ADDR", "0.0.0.0:5045")
+	// UDP OPUS config (Janus pipeline)
+	opusListenAddr := envDefault("OPUS_LISTEN_ADDR", "0.0.0.0:5045")
 	opusSendAddr := envRequired("JANUS_URL") // e.g., "44.5.24.206:5045"
 
 	redisURL := os.Getenv("REDIS_URL")
@@ -46,20 +45,19 @@ svxHost := envRequired("REFLECTOR_HOST")
 	log.Printf("Config: SVX=%s:%d TG=%d | OPUS listen=%s send=%s", 
 		svxHost, svxPort, svxTG, opusListenAddr, opusSendAddr)
 
-	// --- OPUS codecs (all 48kHz, matching SVX) ---
-	// Since we're working with 48kHz OPUS directly, decoders/encoders are simpler
-	svxDec, err := opus.NewDecoder(OpusDecodeRate, 1)
+	// --- OPUS codecs initialized for target layout (48kHz, Stereo) ---
+	svxDec, err := opus.NewDecoder(OpusDecodeRate, 2) // Changed from 1 to 2 (Stereo)
 	if err != nil {
 		log.Fatalf("OPUS decoder (SVX) init: %v", err)
 	}
-	svxEnc, err := opus.NewEncoder(OpusEncodeRate, 1, opus.AppVoIP)
+	svxEnc, err := opus.NewEncoder(OpusEncodeRate, 2, opus.AppVoIP) // Changed from 1 to 2 (Stereo)
 	if err != nil {
 		log.Fatalf("OPUS encoder (SVX) init: %v", err)
 	}
 	svxEnc.SetBitrate(24000)
 	svxEnc.SetComplexity(5)
 
-	log.Println("OPUS codecs initialized (48kHz, 1 channel)")
+	log.Println("OPUS codecs initialized (48kHz, 2 channels - Stereo)")
 
 	// --- Shutdown signal ---
 	sigCh := make(chan os.Signal, 1)
@@ -108,19 +106,13 @@ func runBridge(
 ) error {
 
 	var (
-		svxTalking    bool
-		opusTalking   bool
-		svxTalkMu     sync.Mutex
-		opusTalkMu    sync.Mutex
-		// Audio inactivity watchdog for OPUS→SVX direction
-		opusAudioTimer *time.Timer
-		agcSvxToOpus = NewAGCFromEnv("AGC_SVX_TO_EXT_")
-		agcOpusToSvx = NewAGCFromEnv("AGC_EXT_TO_SVX_")
-		// Voice bandpass filters
+		svxTalking      bool
+		svxTalkMu       sync.Mutex
+		agcSvxToOpus    = NewAGCFromEnv("AGC_SVX_TO_EXT_")
+		agcOpusToSvx    = NewAGCFromEnv("AGC_EXT_TO_SVX_")
 		filterSvxToOpus = NewVoiceFilterFromEnv("FILTER_SVX_TO_EXT_", float64(SVXSampleRate))
 		filterOpusToSvx = NewVoiceFilterFromEnv("FILTER_EXT_TO_SVX_", float64(SVXSampleRate))
 	)
-	const opusStreamWatchdog = 1500 * time.Millisecond
 
 	// --- Redis (optional, for metadata) ---
 	var redisCli *RedisClient
@@ -151,41 +143,33 @@ func runBridge(
 		return fmt.Errorf("OPUS client init: %w", err)
 	}
 
-	// --- SVX → OPUS audio path ---
-	// Receive OPUS 48kHz from SVX, re-encode for OPUS UDP (same rate, just repackage)
+	// --- SVX -> OPUS audio path ---
 	svx.SetAudioCallback(func(opusFrame []byte) {
-		opusTalkMu.Lock()
-		if opusTalking {
-			opusTalkMu.Unlock()
-			return
-		}
-		opusTalkMu.Unlock()
-
-		// Since both are 48kHz OPUS, we could forward directly,
-		// but decode/re-encode to apply filters and AGC.
-		pcm := make([]int16, OpusFrameSize)
+		// Process incoming audio frames from SVX Reflector 
+		// Decode to PCM (Stereo format), apply conditioning, re-encode, and push to Janus
+		pcm := make([]int16, OpusFrameSize*2) // Account for stereo channels space
 		n, err := svxDec.Decode(opusFrame, pcm)
 		if err != nil {
-			log.Printf("[SVX→OPUS] OPUS decode error: %v", err)
+			log.Printf("[SVX->OPUS] OPUS decode error: %v", err)
 			return
 		}
 		if n == 0 {
 			return
 		}
-		pcm = pcm[:n]
+		pcm = pcm[:n*2] // Multiply length by 2 to respect the stereo layout channel pairs
 		filterSvxToOpus.Process(pcm)
 		agcSvxToOpus.Process(pcm)
 
-		// Re-encode to OPUS
-		opusBuf := make([]byte, 512)
+		opusBuf := make([]byte, 1024)
 		nn, err := svxEnc.Encode(pcm, opusBuf)
 		if err != nil {
-			log.Printf("[SVX→OPUS] OPUS encode error: %v", err)
+			log.Printf("[SVX->OPUS] OPUS encode error: %v", err)
 			return
 		}
 
+		// Feeds the network encoder stream. If silent, client logic manages comfort packet insertions.
 		if err := opus.SendAudio(opusBuf[:nn]); err != nil {
-			log.Printf("[SVX→OPUS] SendAudio error: %v", err)
+			log.Printf("[SVX->OPUS] SendAudio error: %v", err)
 		}
 	})
 
@@ -198,16 +182,9 @@ func runBridge(
 		svxTalking = true
 		svxTalkMu.Unlock()
 
-		log.Printf("[SVX→OPUS] Talker start: %s on TG %d", cs, tg)
+		log.Printf("[SVX->OPUS] Talker start: %s on TG %d", cs, tg)
 		filterSvxToOpus.Reset()
 		agcSvxToOpus.Reset()
-
-		streamID, err := opus.StartStream()
-		if err != nil {
-			log.Printf("[SVX→OPUS] StartStream error: %v", err)
-		} else {
-			log.Printf("[SVX→OPUS] OPUS stream started (id=%d)", streamID)
-		}
 	})
 
 	svx.SetTalkerStopCallback(func(tg uint32, cs string) {
@@ -219,114 +196,60 @@ func runBridge(
 		svxTalking = false
 		svxTalkMu.Unlock()
 
-		log.Printf("[SVX→OPUS] Talker stop: %s", cs)
-
-		if err := opus.StopStream(); err != nil {
-			log.Printf("[SVX→OPUS] StopStream error: %v", err)
-		}
+		log.Printf("[SVX->OPUS] Talker stop: %s", cs)
 	})
 
-	// --- OPUS → SVX audio path ---
-	// Receive OPUS 48kHz from UDP, decode to PCM, apply filters, send to SVX
-
+	// --- OPUS -> SVX audio path ---
 	opus.SetStreamStartCallback(func(streamID uint32, senderName string) {
-		svxTalkMu.Lock()
-		if svxTalking {
-			svxTalkMu.Unlock()
-			log.Printf("[OPUS→SVX] Ignoring stream %d from %s (SVX is talking)", streamID, senderName)
-			return
-		}
-		svxTalkMu.Unlock()
-
-		opusTalkMu.Lock()
-		opusTalking = true
-		opusTalkMu.Unlock()
-
-		log.Printf("[OPUS→SVX] Stream start from %s (id=%d)", senderName, streamID)
+		log.Printf("[OPUS->SVX] Audio sequence initializing from Janus (%s)", senderName)
 		filterOpusToSvx.Reset()
 		agcOpusToSvx.Reset()
 		svx.SendTalkerStart(svxTG, callsign)
 
-		// Publish OPUS caller info to Redis
 		if redisCli != nil {
 			redisCli.SetEX("opus_rx:"+strings.TrimSpace(callsign), 30, senderName)
 		}
-
-		if opusAudioTimer != nil {
-			opusAudioTimer.Stop()
-		}
-		opusAudioTimer = time.AfterFunc(opusStreamWatchdog, func() {
-			opusTalkMu.Lock()
-			if !opusTalking {
-				opusTalkMu.Unlock()
-				return
-			}
-			opusTalking = false
-			opusTalkMu.Unlock()
-			log.Printf("[OPUS→SVX] Stream watchdog timeout — forcing TalkerStop")
-			svx.SendTalkerStop(svxTG, callsign)
-			if redisCli != nil {
-				redisCli.Del("opus_rx:" + strings.TrimSpace(callsign))
-			}
-		})
 	})
 
 	opus.SetStreamDataCallback(func(streamID uint32, packetID uint32, opusData []byte) {
 		svxTalkMu.Lock()
 		if svxTalking {
 			svxTalkMu.Unlock()
-			return
+			return // Avoid looping local microphone audio loops back down into SVX 
 		}
 		svxTalkMu.Unlock()
 
-		if opusAudioTimer != nil {
-			opusAudioTimer.Reset(opusStreamWatchdog)
-		}
-
-		// Decode OPUS to PCM 48kHz
-		pcm := make([]int16, OpusFrameSize*2) // allocate enough space
+		// Decode OPUS stream down to standard PCM 48kHz Stereo 
+		pcm := make([]int16, OpusFrameSize*2)
 		n, err := svxDec.Decode(opusData, pcm)
 		if err != nil {
-			log.Printf("[OPUS→SVX] OPUS decode error: %v", err)
+			log.Printf("[OPUS->SVX] OPUS decode error: %v", err)
 			return
 		}
 		if n == 0 {
 			return
 		}
-		pcm = pcm[:n]
+		pcm = pcm[:n*2]
 		filterOpusToSvx.Process(pcm)
 		agcOpusToSvx.Process(pcm)
 
-		// Send to SVX (already 48kHz, 20ms frames)
-		if len(pcm) >= SVXFrameSize {
-			chunk := pcm[:SVXFrameSize]
-			opusBuf := make([]byte, 512)
+		if len(pcm) >= SVXFrameSize*2 {
+			chunk := pcm[:SVXFrameSize*2]
+			opusBuf := make([]byte, 1024)
 			nn, err := svxEnc.Encode(chunk, opusBuf)
 			if err != nil {
-				log.Printf("[OPUS→SVX] OPUS encode error: %v", err)
+				log.Printf("[OPUS->SVX] OPUS encode error: %v", err)
 				return
 			}
 
 			if err := svx.SendAudio(opusBuf[:nn]); err != nil {
-				log.Printf("[OPUS→SVX] SendAudio error: %v", err)
+				log.Printf("[OPUS->SVX] SendAudio error: %v", err)
 			}
 		}
 	})
 
 	opus.SetStreamStopCallback(func(streamID uint32) {
-		if opusAudioTimer != nil {
-			opusAudioTimer.Stop()
-		}
-
-		opusTalkMu.Lock()
-		alreadyStopped := !opusTalking
-		opusTalking = false
-		opusTalkMu.Unlock()
-
-		log.Printf("[OPUS→SVX] Stream stop (id=%d)", streamID)
-		if alreadyStopped {
-			return
-		}
+		log.Printf("[OPUS->SVX] Audio sequence ended from Janus side")
 		svx.SendTalkerStop(svxTG, callsign)
 
 		if redisCli != nil {
@@ -334,7 +257,7 @@ func runBridge(
 		}
 	})
 
-	// --- Connect both sides ---
+	// --- Connect connections and register continuous streams ---
 	if err := svx.Connect(); err != nil {
 		return fmt.Errorf("SVX connect: %w", err)
 	}
@@ -348,14 +271,19 @@ func runBridge(
 		return fmt.Errorf("OPUS connect: %w", err)
 	}
 
-	// --- Start goroutines ---
+	// Immediately initialize continuous delivery session so Janus websocket never hits timeout
+	if _, err := opus.StartStream(); err != nil {
+		log.Printf("[OPUS] Initial continuous stream spin-up failed: %v", err)
+	}
+
+	// --- Start engine background processing loops ---
 	go svx.RunTCPReader()
 	go svx.RunTCPHeartbeat()
 	go svx.RunUDPReader()
 	go svx.RunUDPHeartbeat()
 	go opus.RunReader()
 
-	log.Printf("Bridge active: SVX TG %d ↔ OPUS %s ↔ %s", svxTG, opusListenAddr, opusSendAddr)
+	log.Printf("Bridge active: SVX TG %d <-> OPUS %s <-> %s", svxTG, opusListenAddr, opusSendAddr)
 
 	// --- Wait for disconnect or shutdown ---
 	var result error
