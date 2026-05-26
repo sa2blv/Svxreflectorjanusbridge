@@ -64,8 +64,6 @@ type OpusUDPClient struct {
 }
 
 // NewOpusUDPClient creates a new UDP OPUS/RTP client.
-// listenAddr: local bind address (e.g., "0.0.0.0:5045")
-// sendAddr: remote send address (e.g., "44.5.24.206:5045")
 func NewOpusUDPClient(listenAddr, sendAddr string) (*OpusUDPClient, error) {
 	// Parse send address
 	remoteAddr, err := net.ResolveUDPAddr("udp", sendAddr)
